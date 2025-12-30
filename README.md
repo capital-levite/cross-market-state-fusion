@@ -10,7 +10,7 @@ PPO agent trading 4 concurrent 15-minute binary prediction markets (BTC, ETH, SO
 
 ## Training Journal
 
-### Training Complete: 72 updates, 4,875 trades
+### Training Status: 72 updates, 4,875 trades
 
 **Phase 1: Shaped Rewards (Updates 1-36)**
 - Entropy collapsed 1.09 → 0.36 (policy became deterministic)
@@ -204,3 +204,33 @@ To connect to real trading, you would need:
 - Single-threaded decision loop
 - No persistence of training state across restarts (save manually)
 - Markets may have low liquidity during off-hours
+
+## Live Trading Considerations
+
+Paper trading results won't directly translate to live performance due to:
+
+**Latency**
+- Paper trading assumes instant fills at mid-price
+- Real orders face network latency (50-200ms to Polymarket)
+- Fast-moving markets may move against you before fill
+- Cross-exchange arb signals decay quickly - stale by 100ms+
+
+**Orderbook Impact**
+- Paper trades don't consume liquidity
+- Real orders eat into the book, especially at size
+- Thin books during off-hours = significant slippage
+- Large trades ($100+) may need to walk the book
+
+**Execution Quality**
+- No maker/taker fee modeling in paper mode
+- Partial fills not simulated
+- Queue position matters for limit orders
+- Aggressive orders pay the spread
+
+**Market Microstructure**
+- Other traders react to your orders
+- Visible size on book attracts front-running
+- Repeated patterns get arbitraged away
+- Alpha decay as strategy becomes known
+
+For live trading, expect 20-50% performance degradation from paper results depending on position size and market conditions.

@@ -108,13 +108,13 @@ Critic: Linear(18, 128) -> tanh -> Linear(128, 128) -> tanh -> Linear(128, 1)
 
 ---
 
-## Training Run
+## Training Status
 
 **Date**: December 29, 2025, 19:08 - 20:54
 **Total Updates**: 72 (36 + 36)
 **Total Trades**: 4,875 (1,545 + 3,330)
 **Capital**: $10 base, 50% position sizing ($5/trade)
-**Final PnL**: $10.93 (109% ROI)
+**Current PnL**: $10.93 (109% ROI)
 
 ---
 
