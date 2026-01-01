@@ -25,7 +25,7 @@ from helpers import get_15m_markets, BinanceStreamer, OrderbookStreamer, Market,
 from strategies import (
     Strategy, MarketState, Action,
     create_strategy, AVAILABLE_STRATEGIES,
-    RLStrategy,
+    RLStrategy, RLJaxStrategy, RLHERDDPGStrategy, RLHERPPOStrategy,
 )
 
 # Dashboard integration (optional)
@@ -57,9 +57,10 @@ class TradingEngine:
     Paper trading engine with strategy harness.
     """
 
-    def __init__(self, strategy: Strategy, trade_size: float = 10.0):
+    def __init__(self, strategy: Strategy, trade_size: float = 10.0, max_trades: int = 0):
         self.strategy = strategy
         self.trade_size = trade_size
+        self.max_trades = max_trades
 
         # Streamers
         self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -83,7 +84,11 @@ class TradingEngine:
         self.pending_rewards: Dict[str, float] = {}
 
         # Logger (for RL training)
-        self.logger = get_logger() if isinstance(strategy, RLStrategy) else None
+        is_rl = (RLStrategy is not None and isinstance(strategy, RLStrategy)) or \
+                isinstance(strategy, RLJaxStrategy) or \
+                isinstance(strategy, RLHERDDPGStrategy) or \
+                isinstance(strategy, RLHERPPOStrategy)
+        self.logger = get_logger() if is_rl else None
 
     def refresh_markets(self):
         """Find active 15-min markets."""
@@ -133,7 +138,8 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute paper trade with flexible sizing and slippage."""
+        slippage = 0.005  # 0.5 cent slippage
         if action == Action.HOLD:
             return
 
@@ -147,16 +153,17 @@ class TradingEngine:
         # Close existing position if switching sides
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
+                exit_price = price - slippage
                 shares = pos.size / pos.entry_price
-                pnl = (price - pos.entry_price) * shares
-                self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
+                pnl = (exit_price - pos.entry_price) * shares
+                self._record_trade(pos, exit_price, pnl, "CLOSE UP", cid=cid)
                 self.pending_rewards[cid] = pnl  # Pure realized PnL reward
                 pos.size = 0
                 pos.side = None
                 return
 
             elif action.is_buy and pos.side == "DOWN":
-                exit_down_price = 1 - price  # Current DOWN token price
+                exit_down_price = (1 - price) - slippage  # Current DOWN token price with slippage
                 shares = pos.size / pos.entry_price
                 pnl = (exit_down_price - pos.entry_price) * shares  # DOWN token went up = profit
                 self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
@@ -172,7 +179,7 @@ class TradingEngine:
             if action.is_buy:
                 pos.side = "UP"
                 pos.size = trade_amount
-                pos.entry_price = price
+                pos.entry_price = price + slippage
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
@@ -182,7 +189,7 @@ class TradingEngine:
             elif action.is_sell:
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
+                pos.entry_price = (1 - price) + slippage  # DOWN token price + slippage
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price  # Keep original UP prob for reference
                 pos.time_remaining_at_entry = state.time_remaining
@@ -264,7 +271,11 @@ class TradingEngine:
                 print(f"\n  EXPIRED: {self.markets[cid].asset}")
 
                 # RL: Store terminal experience with final PnL
-                if isinstance(self.strategy, RLStrategy) and self.strategy.training:
+                is_rl = (RLStrategy is not None and isinstance(self.strategy, RLStrategy)) or \
+                        isinstance(self.strategy, RLJaxStrategy) or \
+                        isinstance(self.strategy, RLHERDDPGStrategy) or \
+                        isinstance(self.strategy, RLHERPPOStrategy)
+                if is_rl and self.strategy.training:
                     state = self.states.get(cid)
                     prev_state = self.prev_states.get(cid)
                     pos = self.positions.get(cid)
@@ -373,17 +384,28 @@ class TradingEngine:
                 # For non-RL strategies, force close near expiry as safety
                 # For RL, let it learn to close on its own (gets penalty at expiry)
                 if pos and pos.size > 0 and state.very_near_expiry:
-                    if not isinstance(self.strategy, RLStrategy):
+                    is_rl = (RLStrategy is not None and isinstance(self.strategy, RLStrategy)) or \
+                            isinstance(self.strategy, RLJaxStrategy) or \
+                            isinstance(self.strategy, RLHERDDPGStrategy) or \
+                            isinstance(self.strategy, RLHERPPOStrategy)
+                    if not is_rl:
                         print(f"    ⏰ EARLY CLOSE: {pos.asset}")
                         close_action = Action.SELL if pos.side == "UP" else Action.BUY
                         self.execute_action(cid, close_action, state)
                         continue
 
                 # Get action from strategy
+                # Simulate 1-second latency
+                await asyncio.sleep(1.0)
+                
                 action = self.strategy.act(state)
 
                 # RL: Store experience EVERY tick (dense learning signal)
-                if isinstance(self.strategy, RLStrategy) and self.strategy.training:
+                is_rl = (RLStrategy is not None and isinstance(self.strategy, RLStrategy)) or \
+                        isinstance(self.strategy, RLJaxStrategy) or \
+                        isinstance(self.strategy, RLHERDDPGStrategy) or \
+                        isinstance(self.strategy, RLHERPPOStrategy)
+                if is_rl and self.strategy.training:
                     prev_state = self.prev_states.get(cid)
                     if prev_state:
                         step_reward = self._compute_step_reward(cid, state, action, pos)
@@ -396,6 +418,12 @@ class TradingEngine:
                 # Execute
                 if action != Action.HOLD:
                     self.execute_action(cid, action, state)
+                    
+                # Check max trades
+                if self.max_trades > 0 and self.trade_count >= self.max_trades:
+                    print(f"\n[ENGINE] Reached max trades ({self.max_trades}). Shutting down...")
+                    self.running = False
+                    break
 
             # Status update every 10 ticks (console), but dashboard every tick
             if tick % 10 == 0:
@@ -405,19 +433,29 @@ class TradingEngine:
                 self._update_dashboard_only()
 
             # RL training: emit buffer progress every tick
-            if isinstance(self.strategy, RLStrategy) and self.strategy.training:
-                buffer_size = len(self.strategy.experiences)
+            is_rl = (RLStrategy is not None and isinstance(self.strategy, RLStrategy)) or \
+                    isinstance(self.strategy, RLJaxStrategy) or \
+                    isinstance(self.strategy, RLHERDDPGStrategy) or \
+                    isinstance(self.strategy, RLHERPPOStrategy)
+            if is_rl and self.strategy.training:
+                buffer_size = len(self.strategy.buffer) if hasattr(self.strategy, 'buffer') else \
+                              len(self.strategy.experiences)
                 # Compute average reward from recent experiences
                 avg_reward = None
                 if buffer_size > 0:
-                    recent_rewards = [exp.reward for exp in self.strategy.experiences[-50:]]  # Last 50
+                    # Handle both Experience and HERExperience
+                    recent_rewards = [exp.reward for exp in self.strategy.buffer[-50:]] if hasattr(self.strategy, 'buffer') else \
+                                     [exp.reward for exp in self.strategy.experiences[-50:]]
                     avg_reward = sum(recent_rewards) / len(recent_rewards)
-                emit_rl_buffer(buffer_size, self.strategy.buffer_size, avg_reward)
+                
+                max_buf = self.strategy.buffer_size
+                emit_rl_buffer(buffer_size, max_buf, avg_reward)
 
-                # PPO update when buffer is full
-                if buffer_size >= self.strategy.buffer_size:
+                # PPO/DDPG update when buffer is full
+                if buffer_size >= max_buf:
                     # Get buffer rewards before update clears them
-                    buffer_rewards = [exp.reward for exp in self.strategy.experiences]
+                    buffer_rewards = [exp.reward for exp in self.strategy.buffer] if hasattr(self.strategy, 'buffer') else \
+                                     [exp.reward for exp in self.strategy.experiences]
                     metrics = self.strategy.update()
                     if metrics:
                         print(f"  [RL] loss={metrics['policy_loss']:.4f} "
@@ -557,7 +595,11 @@ class TradingEngine:
             self.print_final_stats()
 
             # Save RL model if training
-            if isinstance(self.strategy, RLStrategy) and self.strategy.training:
+            is_rl = (RLStrategy is not None and isinstance(self.strategy, RLStrategy)) or \
+                    isinstance(self.strategy, RLJaxStrategy) or \
+                    isinstance(self.strategy, RLHERDDPGStrategy) or \
+                    isinstance(self.strategy, RLHERPPOStrategy)
+            if is_rl and self.strategy.training:
                 self.strategy.save("rl_model")
                 print("  [RL] Model saved to rl_model.safetensors")
 
@@ -576,6 +618,7 @@ async def main():
     parser.add_argument("--dashboard", action="store_true", help="Enable web dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
 
+    parser.add_argument("--max-trades", type=int, default=0, help="Stop after N trades")
     args = parser.parse_args()
 
     if not args.strategy:
@@ -605,7 +648,11 @@ async def main():
     strategy = create_strategy(args.strategy)
 
     # RL-specific setup
-    if isinstance(strategy, RLStrategy):
+    is_rl = (RLStrategy is not None and isinstance(strategy, RLStrategy)) or \
+            isinstance(strategy, RLJaxStrategy) or \
+            isinstance(strategy, RLHERDDPGStrategy) or \
+            isinstance(strategy, RLHERPPOStrategy)
+    if is_rl:
         if args.load:
             strategy.load(args.load)
             print(f"Loaded RL model from {args.load}")
@@ -616,7 +663,7 @@ async def main():
             strategy.eval()
 
     # Run
-    engine = TradingEngine(strategy, trade_size=args.size)
+    engine = TradingEngine(strategy, trade_size=args.size, max_trades=args.max_trades)
     await engine.run()
 
 
