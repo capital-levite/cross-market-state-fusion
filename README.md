@@ -2,7 +2,7 @@
 
 RL agents that exploit information lag between fast markets (Binance futures) and slow markets (Polymarket prediction markets) through real-time multi-source state fusion.
 
-**[View the presentation (PDF)](cross-market-state-fusion.pdf)**
+**[View the presentation (PDF)](cross-market-state-fusion.pdf)** | **[LACUNA visual writeup](https://humanplane.com/lacuna)**
 
 ## What This Is
 
@@ -10,15 +10,25 @@ A PPO (Proximal Policy Optimization) agent that paper trades Polymarket's 15-min
 
 **Current status**: Paper trading only. The agent trains and makes decisions on live market data, but doesn't execute real orders.
 
+### Setup
+- **Markets**: 4 concurrent 15-min binary crypto markets (BTC, ETH, SOL, XRP) on Polymarket
+- **Position size**: $5–$500 per trade (configurable via `--size`)
+- **Max exposure**: Position size × 4 markets
+- **Data sources**: Binance futures (order flow, returns) + Polymarket CLOB (orderbook)
+- **Training**: Online PPO with MLX on Apple Silicon, learns from live market data
+- **Reward**: Share-based PnL on position close (sparse signal)
+
 ## What This Proves
 
-1. **RL can learn from sparse PnL signals** - The agent only gets reward when positions close. No intermediate feedback during the 15-minute window. Despite this sparsity, it learns profitable patterns (55% ROI in Phase 2 training).
+1. **RL can learn from sparse PnL signals** - The agent only gets reward when positions close. No intermediate feedback during the 15-minute window. Despite this sparsity, it learns profitable patterns (~$50K PnL, 2,500% ROI in Phase 5 with temporal architecture).
 
 2. **Multi-source data fusion works** - Combining Binance futures order flow and Polymarket orderbook state into a single 18-dim observation gives the agent useful signal.
 
-3. **Low win rate can be profitable** - The agent wins only 21% of trades but profits because binary markets have asymmetric payoffs. Buy at 0.40, win pays 0.60; lose costs 0.40.
+3. **Low win rate can be profitable** - The agent wins only 23% of trades but profits because binary markets have asymmetric payoffs. Buy at 0.40, win pays 0.60; lose costs 0.40.
 
 4. **On-device training is viable** - MLX on Apple Silicon handles real-time PPO updates during live market hours without cloud GPU costs.
+
+5. **Temporal context helps** - Processing the last 5 market states through a TemporalEncoder improves decision quality by capturing momentum and trend patterns.
 
 **Important caveat**: Training uses share-based PnL, not actual binary outcomes. See Phase 4 below for why this matters.
 
@@ -26,9 +36,9 @@ A PPO (Proximal Policy Optimization) agent that paper trades Polymarket's 15-min
 
 1. **Live profitability** - Paper trading assumes instant fills at mid-price. Real trading faces latency, slippage, and market impact. Expect 20-50% performance degradation.
 
-2. **Statistical significance** - 72 updates over 2 hours isn't enough to confirm edge. Could be variance. Needs weeks of out-of-sample testing.
+2. **Statistical significance** - A single session isn't enough to confirm edge. Could be variance. Needs weeks of out-of-sample testing.
 
-3. **Scalability** - $5 positions are invisible to the market. At $100+ the agent's own orders would move prices and consume liquidity.
+3. **Scalability** - $500 positions already show some market impact. At larger sizes the agent's orders would move prices and consume liquidity faster than it can trade.
 
 4. **Persistence of edge** - Markets adapt. If this strategy worked, others would copy it and arbitrage it away.
 
@@ -46,49 +56,23 @@ See [TRAINING_JOURNAL.md](TRAINING_JOURNAL.md) for detailed training analysis.
 
 ---
 
-## Training Status
+## Training Evolution
 
-| Phase | Size | Updates | Trades | PnL | Win Rate | Entropy | ROI |
-|-------|------|---------|--------|-----|----------|---------|-----|
-| 1 (Shaped rewards) | $5 | 36 | 1,545 | $3.90 | 20.2% | 0.36 (collapsed) | - |
-| 2 (Prob-based) | $5 | 36 | 3,330 | $10.93 ($11*) | 21.2% | 1.05 (healthy) | 55% (57%*) |
-| 3 (Scaled up) | $50 | 36 | 4,133 | $23.10 ($76*) | 15.6% | 0.97 (healthy) | 12% (38%*) |
-| 4 (Share-based) | $500 | 46 | 4,873 | $3,392 | 19.0% | 1.08 (healthy) | 170% |
+The agent evolved through 5 phases, each fixing problems discovered in the previous:
 
-**Capital**: Position size × 4 markets = max exposure ($20 Phase 2, $200 Phase 3, $2000 Phase 4)
+| Phase | What Changed | Size | PnL | ROI |
+|-------|--------------|------|-----|-----|
+| 1 | Shaped rewards (failed - entropy collapsed) | $5 | $3.90 | - |
+| 2 | Sparse PnL only, simplified actions (7→3) | $5 | $10.93 | 55% |
+| 3 | Scaled up 10x | $50 | $23.10 | 12% |
+| 4 | Share-based PnL (matches actual market economics) | $500 | $3,392 | 170% |
+| 5 | Temporal architecture + feature normalization | $500 | ~$50K | 2,500% |
 
-*Phases 2-3 used probability-based PnL: `(exit - entry) × dollars`. Phase 4 uses share-based PnL: `(exit - entry) × shares`. The starred values show Phases 2-3 recalculated with share-based formula for comparison.
+**Key insight**: Phase 4's switch from `pnl = (exit - entry) × dollars` to `pnl = (exit - entry) × shares` was the breakthrough. At entry price 0.30, you get 3.33 shares per dollar vs 1.43 at 0.70 - same price move, larger return.
 
-**Key insight**: Phase 3 started with a -$64 drawdown in the first update (unlucky market timing). The agent recovered $87 over the next 35 updates to finish +$23.
+**Phase 5 (LACUNA)**: 10+ hour paper trading session. Added TemporalEncoder to capture momentum from last 5 states. BTC carried with +$40K of the $50K total.
 
-### Phase 3 Analysis
-
-![Phase 3 Trading Analysis](phase3_analysis.png)
-
-**Key findings**:
-- **Equity curve** (top-left): -$75 max drawdown early, then steady recovery. Policy didn't collapse under pressure.
-- **PnL by asset** (top-right): XRP carried (+$44), ETH struggled (-$45). Same policy, different results per asset.
-- **PnL by side** (top-right): UP bets (+$16) outperformed DOWN (-$7) despite similar win rates. Slight long bias works.
-- **Entry distribution** (bottom-left): Agent favors extreme probabilities (near 0 or 1) - hunting asymmetric payoffs.
-- **Duration vs PnL** (bottom-middle): Correlation 0.02 - trade length doesn't predict outcome. Quick flips ≈ longer holds.
-- **Entry timing vs PnL** (bottom-right): Correlation 0.01 - early vs late entry in 15-min window doesn't matter. Agent reacts to market state, not time.
-
-### Phase 4 Analysis: Share-Based PnL
-
-![Phase 4 Trading Analysis](phase4_analysis.png)
-
-Phase 4 switched from probability-based to share-based reward signal:
-
-```
-Old (Phases 1-3): pnl = (exit - entry) × dollars
-New (Phase 4):    pnl = (exit - entry) × shares = (exit - entry) × (dollars / entry)
-```
-
-**Why this matters**: Share-based PnL reflects actual binary market economics. When you buy at probability 0.30, you get more shares per dollar than at 0.70. The reward signal now amplifies gains from low-probability entries proportionally.
-
-**Results**: 170% ROI vs 38% (Phase 3 recalculated) — **4.5x improvement** in ROI per dollar of exposure.
-
-**Key observation**: The agent learned to exploit the share-based dynamics. With the reward signal matching actual market mechanics, the policy optimizes for what really matters: finding asymmetric entries where price moves generate outsized returns.
+See [TRAINING_JOURNAL.md](TRAINING_JOURNAL.md) for detailed analysis with charts and code.
 
 ---
 
@@ -136,23 +120,31 @@ Fixed 50% position sizing. Originally had 7 actions with variable sizing (25/50/
 ## Network
 
 ```
-Actor:  18 → 128 (tanh) → 128 (tanh) → 3 (softmax)
-Critic: 18 → 128 (tanh) → 128 (tanh) → 1
+TemporalEncoder: (5 states × 18 features) → 64 → LayerNorm → tanh → 32
+
+Actor:  [current(18) + temporal(32)] → 64 → LN → tanh → 64 → LN → tanh → 3 (softmax)
+Critic: [current(18) + temporal(32)] → 96 → LN → tanh → 96 → LN → tanh → 1
 ```
+
+- **Temporal processing**: Last 5 states compressed into 32-dim momentum/trend features
+- **Asymmetric**: Larger critic (96) vs actor (64) for better value estimation
+- **Normalization**: All 18 features clamped to [-1, 1]
 
 ## PPO Hyperparameters
 
-| Parameter | Value |
-|-----------|-------|
-| `lr_actor` | 1e-4 |
-| `lr_critic` | 3e-4 |
-| `gamma` | 0.99 |
-| `gae_lambda` | 0.95 |
-| `clip_epsilon` | 0.2 |
-| `entropy_coef` | 0.10 |
-| `buffer_size` | 512 |
-| `batch_size` | 64 |
-| `n_epochs` | 10 |
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `lr_actor` | 1e-4 | |
+| `lr_critic` | 3e-4 | Higher for faster value learning |
+| `gamma` | 0.95 | Short horizon (15-min markets) |
+| `gae_lambda` | 0.95 | |
+| `clip_epsilon` | 0.2 | |
+| `entropy_coef` | 0.03 | Low - allow sparse policy (mostly HOLD) |
+| `buffer_size` | 256 | Small for faster adaptation |
+| `batch_size` | 64 | |
+| `n_epochs` | 10 | |
+| `history_len` | 5 | Temporal context window |
+| `temporal_dim` | 32 | Compressed momentum features |
 
 ---
 

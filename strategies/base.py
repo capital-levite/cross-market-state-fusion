@@ -24,8 +24,30 @@ class Action(Enum):
 
     @property
     def size_multiplier(self) -> float:
-        """Fixed 50% sizing for all trades."""
+        """Base 50% sizing for trades (adjusted by confidence in TradingEngine)."""
         return 0.5 if self in (Action.BUY, Action.SELL) else 0.0
+
+    def get_confidence_size(self, prob: float) -> float:
+        """
+        Get position size multiplier based on probability extremeness.
+
+        At extreme probabilities (near 0 or 1), we have higher edge due to
+        asymmetric payoffs in binary markets. Scale size accordingly.
+
+        Returns: size multiplier in [0.25, 1.0]
+        """
+        if self == Action.HOLD:
+            return 0.0
+
+        # Distance from 0.5 - higher = more extreme
+        extremeness = abs(prob - 0.5) * 2  # [0, 1]
+
+        # Scale from 0.25 (at 0.5) to 1.0 (at extremes)
+        # More aggressive at extremes where edge is higher
+        base = 0.25
+        scale = 0.75  # max additional size
+
+        return base + (scale * extremeness)
 
 
 @dataclass
@@ -82,46 +104,48 @@ class MarketState:
     trend_regime: float = 0.0  # Trending or ranging
 
     def to_features(self) -> np.ndarray:
-        """Convert to feature vector for ML models. Returns 18 features optimized for 15-min."""
+        """Convert to feature vector for ML models. Returns 18 features normalized to [-1, 1]."""
         velocity = self._velocity(3)  # Shorter window
         vol_5m = self._volatility(30)  # ~5 min of ticks
 
         # Spread as percentage
         spread_pct = self.spread / max(0.01, self.prob) if self.prob > 0 else 0.0
 
-        # Time remaining features (non-linear urgency)
-        time_remaining_sq = self.time_remaining ** 2
+        # Helper to clamp values to [-1, 1]
+        def clamp(x, min_val=-1.0, max_val=1.0):
+            return max(min_val, min(max_val, x))
 
         return np.array([
-            # Ultra-short momentum (3)
-            self.returns_1m * 100,
-            self.returns_5m * 100,
-            self.returns_10m * 100,
+            # Ultra-short momentum (3) - returns scaled and clamped
+            # Typical returns are -0.02 to 0.02, so *50 maps to [-1, 1]
+            clamp(self.returns_1m * 50),
+            clamp(self.returns_5m * 50),
+            clamp(self.returns_10m * 50),
 
-            # Order flow - THE EDGE (4)
-            self.order_book_imbalance_l1,
-            self.order_book_imbalance_l5,
-            self.trade_flow_imbalance,
-            self.cvd_acceleration,
+            # Order flow - THE EDGE (4) - already [-1, 1] range mostly
+            clamp(self.order_book_imbalance_l1),
+            clamp(self.order_book_imbalance_l5),
+            clamp(self.trade_flow_imbalance),
+            clamp(self.cvd_acceleration * 10),  # CVD accel is small, scale up
 
             # Microstructure (3)
-            spread_pct * 100,
-            self.trade_intensity,
-            self.large_trade_flag,
+            clamp(spread_pct * 20),  # Spread ~0-5%, so *20 maps to [0,1]
+            clamp(self.trade_intensity / 10),  # Normalize by typical max intensity
+            self.large_trade_flag,  # Already 0 or 1
 
             # Volatility (2)
-            vol_5m,
-            self.vol_expansion,
+            clamp(vol_5m * 20),  # Vol ~0-5%, scale up
+            clamp(self.vol_expansion),  # Typically [-1, 2], clamp it
 
             # Position (4)
-            float(self.has_position),
+            float(self.has_position),  # 0 or 1
             1.0 if self.position_side == "UP" else (-1.0 if self.position_side == "DOWN" else 0.0),
-            self.position_pnl,
-            self.time_remaining,  # CRITICAL
+            clamp(self.position_pnl / 50),  # Normalize by typical PnL range ($50)
+            self.time_remaining,  # Already [0, 1]
 
             # Regime (2)
-            self.vol_regime,
-            self.trend_regime,
+            self.vol_regime,  # 0 or 1
+            self.trend_regime,  # 0 or 1
         ], dtype=np.float32)
 
     def _velocity(self, window: int = 5) -> float:

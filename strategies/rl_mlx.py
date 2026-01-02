@@ -4,11 +4,18 @@ MLX-based PPO (Proximal Policy Optimization) strategy.
 
 Uses Apple's MLX framework for proper automatic differentiation
 instead of manual NumPy backprop.
+
+Key optimizations for 15-min binary markets:
+- Temporal processing: captures momentum by attending to last N states
+- Asymmetric architecture: larger critic (96) for better value estimation
+- Lower gamma (0.95): appropriate for short-horizon trading
+- Smaller buffer (256): faster adaptation to regime changes
 """
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
+from collections import deque
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 from .base import Strategy, MarketState, Action
@@ -16,74 +23,169 @@ from .base import Strategy, MarketState, Action
 
 @dataclass
 class Experience:
-    """Single experience tuple."""
-    state: np.ndarray
+    """Single experience tuple with temporal context."""
+    state: np.ndarray  # Current state features (18,)
+    temporal_state: np.ndarray  # Stacked temporal features (history_len * 18,)
     action: int
     reward: float
     next_state: np.ndarray
+    next_temporal_state: np.ndarray
     done: bool
     log_prob: float
     value: float
 
 
-class Actor(nn.Module):
-    """Policy network: state -> action probabilities."""
+class TemporalEncoder(nn.Module):
+    """Encodes temporal sequence of states into momentum/trend features.
 
-    def __init__(self, input_dim: int = 18, hidden_size: int = 128, output_dim: int = 3):
+    Takes last N states and compresses them into a fixed-size representation
+    that captures velocity, acceleration, and trend direction.
+
+    Architecture: (history_len * 18) → 64 → LayerNorm → tanh → 32
+    Output is concatenated with current state features.
+    """
+
+    def __init__(self, input_dim: int = 18, history_len: int = 5, output_dim: int = 32):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, output_dim)
+        self.history_len = history_len
+        self.temporal_input = input_dim * history_len
+        self.fc1 = nn.Linear(self.temporal_input, 64)
+        self.ln1 = nn.LayerNorm(64)
+        self.fc2 = nn.Linear(64, output_dim)
+        self.ln2 = nn.LayerNorm(output_dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        """Forward pass. Returns action probabilities."""
-        h = mx.tanh(self.fc1(x))
-        h = mx.tanh(self.fc2(h))
+        """Forward pass. x is (batch, history_len * input_dim)."""
+        h = mx.tanh(self.ln1(self.fc1(x)))
+        h = mx.tanh(self.ln2(self.fc2(h)))
+        return h
+
+
+class Actor(nn.Module):
+    """Policy network with temporal awareness.
+
+    Architecture:
+        Current state (18) + Temporal features (32) = 50
+        → 64 → LayerNorm → tanh → 64 → LayerNorm → tanh → 3 (softmax)
+
+    Temporal encoder captures momentum/trends from state history.
+    Smaller network (64) to prevent overfitting on enhanced features.
+    """
+
+    def __init__(self, input_dim: int = 18, hidden_size: int = 64, output_dim: int = 3,
+                 history_len: int = 5, temporal_dim: int = 32):
+        super().__init__()
+        self.temporal_encoder = TemporalEncoder(input_dim, history_len, temporal_dim)
+
+        # Combined input: current state + temporal features
+        combined_dim = input_dim + temporal_dim
+        self.fc1 = nn.Linear(combined_dim, hidden_size)
+        self.ln1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.ln2 = nn.LayerNorm(hidden_size)
+        self.fc3 = nn.Linear(hidden_size, output_dim)
+
+    def __call__(self, current_state: mx.array, temporal_state: mx.array) -> mx.array:
+        """Forward pass. Returns action probabilities.
+
+        Args:
+            current_state: (batch, 18) current features
+            temporal_state: (batch, history_len * 18) stacked history
+        """
+        # Encode temporal context
+        temporal_features = self.temporal_encoder(temporal_state)
+
+        # Combine current + temporal
+        combined = mx.concatenate([current_state, temporal_features], axis=-1)
+
+        h = mx.tanh(self.ln1(self.fc1(combined)))
+        h = mx.tanh(self.ln2(self.fc2(h)))
         logits = self.fc3(h)
         probs = mx.softmax(logits, axis=-1)
         return probs
 
 
 class Critic(nn.Module):
-    """Value network: state -> expected return."""
+    """Value network with temporal awareness - ASYMMETRIC (larger than actor).
 
-    def __init__(self, input_dim: int = 18, hidden_size: int = 128):
+    Architecture:
+        Current state (18) + Temporal features (32) = 50
+        → 96 → LayerNorm → tanh → 96 → LayerNorm → tanh → 1
+
+    Larger network (96 vs 64) because:
+    - Value estimation is harder than policy
+    - Critic doesn't overfit as easily (regresses to scalar)
+    - Better value estimates improve advantage computation
+    """
+
+    def __init__(self, input_dim: int = 18, hidden_size: int = 96,
+                 history_len: int = 5, temporal_dim: int = 32):
         super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_size)
+        self.temporal_encoder = TemporalEncoder(input_dim, history_len, temporal_dim)
+
+        # Combined input: current state + temporal features
+        combined_dim = input_dim + temporal_dim
+        self.fc1 = nn.Linear(combined_dim, hidden_size)
+        self.ln1 = nn.LayerNorm(hidden_size)
         self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.ln2 = nn.LayerNorm(hidden_size)
         self.fc3 = nn.Linear(hidden_size, 1)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        """Forward pass. Returns value estimate."""
-        h = mx.tanh(self.fc1(x))
-        h = mx.tanh(self.fc2(h))
+    def __call__(self, current_state: mx.array, temporal_state: mx.array) -> mx.array:
+        """Forward pass. Returns value estimate.
+
+        Args:
+            current_state: (batch, 18) current features
+            temporal_state: (batch, history_len * 18) stacked history
+        """
+        # Encode temporal context
+        temporal_features = self.temporal_encoder(temporal_state)
+
+        # Combine current + temporal
+        combined = mx.concatenate([current_state, temporal_features], axis=-1)
+
+        h = mx.tanh(self.ln1(self.fc1(combined)))
+        h = mx.tanh(self.ln2(self.fc2(h)))
         value = self.fc3(h)
         return value
 
 
 class RLStrategy(Strategy):
-    """PPO-based strategy with actor-critic architecture using MLX."""
+    """PPO-based strategy with temporal-aware actor-critic architecture using MLX.
+
+    Key features:
+    - Temporal processing: maintains history of last N states to capture momentum
+    - Asymmetric architecture: larger critic (96) for better value estimation
+    - Lower gamma (0.95): appropriate for 15-min trading horizon
+    - Smaller buffer (256): faster adaptation to regime changes
+    """
 
     def __init__(
         self,
         input_dim: int = 18,
-        hidden_size: int = 128,
+        hidden_size: int = 64,  # Actor hidden size
+        critic_hidden_size: int = 96,  # Larger critic for better value estimation
+        history_len: int = 5,  # Number of past states for temporal processing
+        temporal_dim: int = 32,  # Temporal encoder output size
         lr_actor: float = 1e-4,
         lr_critic: float = 3e-4,
-        gamma: float = 0.99,  # Shorter horizon for 15-min markets
+        gamma: float = 0.95,  # Lower gamma for 15-min horizon (was 0.99)
         gae_lambda: float = 0.95,
         clip_epsilon: float = 0.2,
-        entropy_coef: float = 0.10,  # Higher entropy to prevent premature convergence
+        entropy_coef: float = 0.03,  # Lower entropy to allow sparse policy (mostly HOLD)
         value_coef: float = 0.5,
         max_grad_norm: float = 0.5,
-        buffer_size: int = 512,  # Faster updates (4x more frequent)
-        batch_size: int = 64,  # Smaller batches for smaller buffer
+        buffer_size: int = 256,  # Smaller buffer for faster adaptation (was 512)
+        batch_size: int = 64,
         n_epochs: int = 10,
         target_kl: float = 0.02,
     ):
         super().__init__("rl")
         self.input_dim = input_dim
         self.hidden_size = hidden_size
+        self.critic_hidden_size = critic_hidden_size
+        self.history_len = history_len
+        self.temporal_dim = temporal_dim
         self.output_dim = 3  # BUY, HOLD, SELL (simplified)
 
         # Hyperparameters
@@ -100,9 +202,9 @@ class RLStrategy(Strategy):
         self.n_epochs = n_epochs
         self.target_kl = target_kl
 
-        # Networks
-        self.actor = Actor(input_dim, hidden_size, self.output_dim)
-        self.critic = Critic(input_dim, hidden_size)
+        # Networks with temporal processing
+        self.actor = Actor(input_dim, hidden_size, self.output_dim, history_len, temporal_dim)
+        self.critic = Critic(input_dim, critic_hidden_size, history_len, temporal_dim)
 
         # Optimizers
         self.actor_optimizer = optim.Adam(learning_rate=lr_actor)
@@ -110,6 +212,9 @@ class RLStrategy(Strategy):
 
         # Experience buffer
         self.experiences: List[Experience] = []
+
+        # Temporal state history (per-market, keyed by asset)
+        self._state_history: Dict[str, deque] = {}
 
         # Running stats for reward normalization
         self.reward_mean = 0.0
@@ -119,18 +224,48 @@ class RLStrategy(Strategy):
         # For storing last action's log prob and value
         self._last_log_prob = 0.0
         self._last_value = 0.0
+        self._last_temporal_state: Optional[np.ndarray] = None
 
         # Eval networks on init
         mx.eval(self.actor.parameters(), self.critic.parameters())
 
-    def act(self, state: MarketState) -> Action:
-        """Select action using current policy."""
-        features = state.to_features()
-        features_mx = mx.array(features.reshape(1, -1))
+    def _get_temporal_state(self, asset: str, current_features: np.ndarray) -> np.ndarray:
+        """Get stacked temporal state for an asset.
 
-        # Get action probabilities and value
-        probs = self.actor(features_mx)
-        value = self.critic(features_mx)
+        Maintains a history of the last N states per asset.
+        Returns flattened array of shape (history_len * input_dim,).
+        """
+        if asset not in self._state_history:
+            self._state_history[asset] = deque(maxlen=self.history_len)
+
+        history = self._state_history[asset]
+
+        # Add current state to history
+        history.append(current_features.copy())
+
+        # Pad with zeros if not enough history
+        if len(history) < self.history_len:
+            padding = [np.zeros(self.input_dim, dtype=np.float32)] * (self.history_len - len(history))
+            stacked = np.concatenate(padding + list(history))
+        else:
+            stacked = np.concatenate(list(history))
+
+        return stacked.astype(np.float32)
+
+    def act(self, state: MarketState) -> Action:
+        """Select action using current policy with temporal context."""
+        features = state.to_features()
+
+        # Get temporal state (stacked history)
+        temporal_state = self._get_temporal_state(state.asset, features)
+
+        # Convert to MLX arrays
+        features_mx = mx.array(features.reshape(1, -1))
+        temporal_mx = mx.array(temporal_state.reshape(1, -1))
+
+        # Get action probabilities and value with temporal context
+        probs = self.actor(features_mx, temporal_mx)
+        value = self.critic(features_mx, temporal_mx)
 
         # Eval to get values
         mx.eval(probs, value)
@@ -148,12 +283,13 @@ class RLStrategy(Strategy):
         # Store for experience collection
         self._last_log_prob = float(np.log(probs_np[action_idx] + 1e-8))
         self._last_value = value_np
+        self._last_temporal_state = temporal_state
 
         return Action(action_idx)
 
     def store(self, state: MarketState, action: Action, reward: float,
               next_state: MarketState, done: bool):
-        """Store experience for training."""
+        """Store experience for training with temporal context."""
         # Update running reward stats for normalization
         self.reward_count += 1
         delta = reward - self.reward_mean
@@ -166,11 +302,17 @@ class RLStrategy(Strategy):
         # Normalize reward
         norm_reward = (reward - self.reward_mean) / (self.reward_std + 1e-8)
 
+        # Get next temporal state (updates history with next_state)
+        next_features = next_state.to_features()
+        next_temporal_state = self._get_temporal_state(next_state.asset, next_features)
+
         exp = Experience(
             state=state.to_features(),
+            temporal_state=self._last_temporal_state if self._last_temporal_state is not None else np.zeros(self.history_len * self.input_dim, dtype=np.float32),
             action=action.value,
             reward=norm_reward,
-            next_state=next_state.to_features(),
+            next_state=next_features,
+            next_temporal_state=next_temporal_state,
             done=done,
             log_prob=self._last_log_prob,
             value=self._last_value,
@@ -206,45 +348,49 @@ class RLStrategy(Strategy):
         return advantages, returns
 
     def _clip_grad_norm(self, grads: dict, max_norm: float) -> dict:
-        """Clip gradients by global norm."""
-        # Compute global norm
-        total_norm_sq = 0.0
-        for key, val in grads.items():
-            if isinstance(val, dict):
-                for subkey, subval in val.items():
-                    total_norm_sq += float(mx.sum(subval ** 2))
-            else:
-                total_norm_sq += float(mx.sum(val ** 2))
+        """Clip gradients by global norm (handles arbitrarily nested dicts)."""
 
+        def compute_norm_sq(g):
+            """Recursively compute sum of squared gradients."""
+            if isinstance(g, dict):
+                return sum(compute_norm_sq(v) for v in g.values())
+            else:
+                return float(mx.sum(g ** 2))
+
+        def scale_grad(g, coef):
+            """Recursively scale gradients."""
+            if isinstance(g, dict):
+                return {k: scale_grad(v, coef) for k, v in g.items()}
+            return g * coef
+
+        # Compute global norm
+        total_norm_sq = compute_norm_sq(grads)
         total_norm = np.sqrt(total_norm_sq)
         clip_coef = max_norm / (total_norm + 1e-6)
 
         if clip_coef < 1.0:
-            def scale_grad(g):
-                if isinstance(g, dict):
-                    return {k: scale_grad(v) for k, v in g.items()}
-                return g * clip_coef
-
-            grads = {k: scale_grad(v) for k, v in grads.items()}
+            grads = scale_grad(grads, clip_coef)
 
         return grads
 
     def update(self) -> Optional[Dict[str, float]]:
-        """Update policy using PPO with proper MLX autograd."""
+        """Update policy using PPO with proper MLX autograd and temporal context."""
         if len(self.experiences) < self.buffer_size:
             return None
 
-        # Convert experiences to arrays
+        # Convert experiences to arrays (including temporal states)
         states = np.array([e.state for e in self.experiences], dtype=np.float32)
+        temporal_states = np.array([e.temporal_state for e in self.experiences], dtype=np.float32)
         actions = np.array([e.action for e in self.experiences], dtype=np.int32)
         rewards = np.array([e.reward for e in self.experiences], dtype=np.float32)
         dones = np.array([e.done for e in self.experiences], dtype=np.float32)
         old_log_probs = np.array([e.log_prob for e in self.experiences], dtype=np.float32)
         old_values = np.array([e.value for e in self.experiences], dtype=np.float32)
 
-        # Compute next value for GAE
+        # Compute next value for GAE (with temporal context)
         next_state_mx = mx.array(self.experiences[-1].next_state.reshape(1, -1))
-        next_value = float(np.array(self.critic(next_state_mx)[0, 0]))
+        next_temporal_mx = mx.array(self.experiences[-1].next_temporal_state.reshape(1, -1))
+        next_value = float(np.array(self.critic(next_state_mx, next_temporal_mx)[0, 0]))
 
         # Compute advantages and returns
         advantages, returns = self._compute_gae(rewards, old_values, dones, next_value)
@@ -252,8 +398,9 @@ class RLStrategy(Strategy):
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Convert to MLX arrays
+        # Convert to MLX arrays (including temporal states)
         states_mx = mx.array(states)
+        temporal_states_mx = mx.array(temporal_states)
         actions_mx = mx.array(actions)
         old_log_probs_mx = mx.array(old_log_probs)
         advantages_mx = mx.array(advantages.astype(np.float32))
@@ -283,6 +430,7 @@ class RLStrategy(Strategy):
 
                 # Get batch using mx.take (MLX doesn't support numpy fancy indexing)
                 batch_states = mx.take(states_mx, batch_idx, axis=0)
+                batch_temporal = mx.take(temporal_states_mx, batch_idx, axis=0)
                 batch_actions = mx.take(actions_mx, batch_idx, axis=0)
                 batch_old_log_probs = mx.take(old_log_probs_mx, batch_idx, axis=0)
                 batch_advantages = mx.take(advantages_mx, batch_idx, axis=0)
@@ -291,7 +439,7 @@ class RLStrategy(Strategy):
 
                 # Define loss function for actor (takes model, not params)
                 def actor_loss_fn(model):
-                    probs = model(batch_states)
+                    probs = model(batch_states, batch_temporal)
 
                     # Get log probs for taken actions
                     batch_size_local = batch_actions.shape[0]
@@ -320,7 +468,7 @@ class RLStrategy(Strategy):
 
                 # Define loss function for critic (takes model, not params)
                 def critic_loss_fn(model):
-                    values = model(batch_states).squeeze()
+                    values = model(batch_states, batch_temporal).squeeze()
 
                     # Value loss with clipping (PPO2 style)
                     values_clipped = batch_old_values + mx.clip(
@@ -395,8 +543,10 @@ class RLStrategy(Strategy):
         }
 
     def reset(self):
-        """Clear experience buffer."""
+        """Clear experience buffer and state history."""
         self.experiences.clear()
+        self._state_history.clear()
+        self._last_temporal_state = None
 
     def save(self, path: str):
         """Save model and training state."""
@@ -419,13 +569,21 @@ class RLStrategy(Strategy):
         weights_path = path.replace(".npz", "") + ".safetensors"
         mx.save_safetensors(weights_path, weights)
 
-        # Save stats separately
+        # Save stats and architecture params separately
         stats_path = path.replace(".npz", "") + "_stats.npz"
         np.savez(
             stats_path,
             reward_mean=self.reward_mean,
             reward_std=self.reward_std,
             reward_count=self.reward_count,
+            # Architecture params for reconstruction
+            input_dim=self.input_dim,
+            hidden_size=self.hidden_size,
+            critic_hidden_size=self.critic_hidden_size,
+            history_len=self.history_len,
+            temporal_dim=self.temporal_dim,
+            gamma=self.gamma,
+            buffer_size=self.buffer_size,
         )
 
     def load(self, path: str):

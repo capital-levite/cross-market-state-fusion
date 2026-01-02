@@ -10,7 +10,7 @@ Training a PPO agent to trade 15-minute binary prediction markets. This document
 
 **Setup**: Paper trade 4 concurrent crypto markets (BTC, ETH, SOL, XRP) on Polymarket using live data from Binance + Polymarket orderbooks.
 
-**Result**: 55% ROI in Phase 2 ($5 trades), 44% recovery ROI in Phase 3 ($50 trades) after overcoming a -$64 drawdown. The path there was interesting.
+**Result**: ~$50K PnL (2,500% ROI) in Phase 5 with temporal architecture. The path there was interesting - from reward shaping failures to sparse PnL rewards to share-based economics.
 
 ---
 
@@ -28,7 +28,7 @@ The same neural network decides for all assets - learning generalizable crypto p
 ### Unique Market Structure
 
 Polymarket's 15-minute crypto markets are unusual:
-- **Binary resolution**: Market resolves to $1 or $0 based on price direction. But our training uses probability-based PnL, not actual resolution.
+- **Binary resolution**: Market resolves to $1 or $0 based on price direction. Training uses share-based PnL (Phase 4+), which matches actual binary market economics.
 - **Known resolution time**: You know exactly when the market closes. Changes the decision calculus.
 - **Orderbook-based**: Real CLOB with bid/ask spreads, not an AMM.
 - **Cross-exchange lag**: Polymarket prices lag Binance by seconds. Exploitable.
@@ -52,33 +52,22 @@ This is a general pattern: **fast signal source + slow execution venue**. The sa
 - Weather derivatives (forecast models + prediction markets)
 - Any market where information propagates with measurable delay
 
-This creates an 18-dimensional state that captures both underlying asset dynamics AND prediction market microstructure:
-
-| Category | Features |
-|----------|----------|
-| Momentum | 1m/5m/10m returns |
-| Order flow | L1/L5 imbalance, trade flow, CVD acceleration |
-| Microstructure | Spread %, trade intensity, large trade flag |
-| Volatility | 5m vol, vol expansion ratio |
-| Position | Has position, side, PnL, time remaining |
-| Regime | Vol regime, trend regime |
+This creates an 18-dimensional state that captures both underlying asset dynamics AND prediction market microstructure. See [README.md](README.md) for the full feature breakdown.
 
 ### Sparse Reward Signal (Current Approach)
 
 After Phase 1's reward shaping failed (see Training Evolution below), we switched to sparse rewards: the agent only receives reward when a position closes. No intermediate feedback while holding.
 
-**Important caveat**: The reward is based on **probability change**, not actual market resolution. When a position closes (either by explicit sell or at market expiry):
+**Current approach (Phase 4+)**: The reward is based on **share-based PnL**, which reflects actual binary market economics. When a position closes:
 
 ```
-UP position:   pnl = (exit_prob - entry_prob) × size
-DOWN position: pnl = (entry_prob - exit_prob) × size
+shares = dollars / entry_price
+pnl = (exit_price - entry_price) × shares
 ```
 
-Example trades:
-- Buy UP at 0.55, sell at 0.65 → reward = +$0.10 × size
-- Buy UP at 0.55, hold to expiry where prob = 0.70 → reward = +$0.15 × size
+This amplifies returns from low-probability entries proportionally. Buy at 0.30 and you get 3.33 shares per dollar vs 1.43 shares at 0.70.
 
-Note: At expiry, we use the final probability, not the binary outcome ($1 or $0). This means training signal differs from true realized PnL. The agent learns "did probability move my way?" rather than "did I predict the actual outcome correctly?"
+**Historical note**: Phases 1-3 used probability-based PnL: `(exit - entry) × dollars`. Phase 4 switched to share-based after discovering it better matches actual market mechanics, resulting in a 4.5x improvement in ROI.
 
 This sparsity makes credit assignment harder. The agent takes actions every tick but only learns from PnL when positions close. Phase 1 tried to solve this with dense shaping rewards—it backfired.
 
@@ -192,35 +181,26 @@ You can win 40% of the time and break even. Win 21% of the time but pick your sp
 
 ---
 
-## What Changed Between Phases
+### Phase 1 → 2: The Fix
 
 | Aspect | Phase 1 | Phase 2 |
 |--------|---------|---------|
-| Reward | PnL delta + shaping bonuses | Probability-based PnL (normalized) |
-| Gamma | 0.995 | 0.99 |
+| Reward | PnL delta + shaping bonuses | Sparse PnL only |
 | Entropy coef | 0.02 → 0.05 | 0.10 |
 | Buffer/batch | 2048/128 | 512/64 |
 | Actions | 7 (variable sizing) | 3 (fixed 50%) |
 | Final entropy | 0.36 (collapsed) | 1.05 (healthy) |
-| Final PnL | $3.90 | $10.93 |
 
-**Key changes**:
-
-1. **Removed ALL shaping rewards** - No micro-bonuses, no transaction costs, no spread penalty. Just pure `(exit_prob - entry_prob) * size` on close.
-
-2. **5x entropy coefficient** (0.02 → 0.10) - Stronger exploration incentive. Prevented policy collapse.
-
-3. **Simplified action space** (7 → 3) - Reduced from HOLD + 3 buy sizes + 3 sell sizes to just HOLD, BUY, SELL. Learn *when* to trade before *how much*.
-
-4. **Smaller buffer** (2048 → 512) - 4x more frequent updates. Faster learning signal.
-
-5. **Lower gamma** (0.995 → 0.99) - 15-min markets are short; don't over-weight distant rewards.
-
-6. **Reset reward normalization** - Old running stats were calibrated to shaped rewards.
+**What fixed it**:
+1. Removed ALL shaping rewards - just `(exit_prob - entry_prob) * size` on close
+2. 5x entropy coefficient (0.02 → 0.10) - stronger exploration
+3. Simplified actions (7 → 3) - learn *when* before *how much*
+4. Smaller buffer (2048 → 512) - faster updates
+5. Reset reward normalization stats
 
 ---
 
-## Technical Notes
+### Technical Notes
 
 See [README.md](README.md) for full architecture and hyperparameters.
 
@@ -259,6 +239,18 @@ The critic learned to predict a noisier, more meaningful signal.
 - Entropy remained healthy (0.97) - no policy collapse despite the drawdown
 - Win rate dropped to 15.6% but remained profitable (asymmetric payoffs)
 - Recovery of $87 over 35 updates demonstrates robustness to adverse starts
+
+#### Phase 3 Analysis
+
+![Phase 3 Trading Analysis](phase3_analysis.png)
+
+**Key findings**:
+- **Equity curve** (top-left): -$75 max drawdown early, then steady recovery. Policy didn't collapse under pressure.
+- **PnL by asset** (top-right): XRP carried (+$44), ETH struggled (-$45). Same policy, different results per asset.
+- **PnL by side** (top-right): UP bets (+$16) outperformed DOWN (-$7) despite similar win rates. Slight long bias works.
+- **Entry distribution** (bottom-left): Agent favors extreme probabilities (near 0 or 1) - hunting asymmetric payoffs.
+- **Duration vs PnL** (bottom-middle): Correlation 0.02 - trade length doesn't predict outcome. Quick flips ≈ longer holds.
+- **Entry timing vs PnL** (bottom-right): Correlation 0.01 - early vs late entry in 15-min window doesn't matter. Agent reacts to market state, not time.
 
 ---
 
@@ -305,6 +297,36 @@ pnl = (exit_price - entry_price) * shares
 - Large early drawdown (-$465 at update 20) followed by strong recovery
 - Policy learned to exploit share-based dynamics: seek low-probability entries where price moves generate outsized returns
 
+#### Phase 4 Analysis
+
+![Phase 4 Trading Analysis](phase4_analysis.png)
+
+The switch from probability-based to share-based PnL yielded a 4.5x improvement in ROI. The agent learned to seek low-probability entries where the same price move generates proportionally larger returns due to share mechanics.
+
+---
+
+### Phase 5: LACUNA (Temporal Architecture)
+
+**[Visual writeup and story →](https://humanplane.com/lacuna)**
+
+**Changes made**:
+1. Added TemporalEncoder to process last 5 states into 32-dim momentum/trend features
+2. Asymmetric actor-critic: Actor (64 hidden) vs Critic (96 hidden)
+3. Feature normalization: All 18 input features clamped to [-1, 1]
+4. Reduced gamma (0.99 → 0.95) and entropy coef (0.10 → 0.03)
+5. Smaller buffer (512 → 256) for faster adaptation
+6. Fixed market discovery bugs: persistent retry loop, fresh aiohttp sessions
+
+**Duration**: 10+ hours | **Trades**: 34,730 | **Size**: $500/trade | **Mode**: Paper trading
+
+**Final**: ~$50K PnL on $2,000 max exposure = **2,500% ROI** | **Win Rate**: 23.3%
+
+**By asset performance**:
+- BTC: +$40,088 (carried the session)
+- ETH: +$7,648
+- SOL: +$994
+- XRP: +$593
+
 ---
 
 ## Takeaways
@@ -313,12 +335,16 @@ pnl = (exit_price - entry_price) * shares
 
 2. **Reward signal design matters** - Share-based PnL (Phase 4) outperformed probability-based PnL (Phases 2-3) by 4.5x ROI. The reward signal should match actual market economics.
 
-3. **Entropy coefficient matters** - 0.05 caused policy collapse; 0.10 maintained healthy exploration. Small hyperparameter, big impact.
+3. **Entropy coefficient matters** - 0.05 caused policy collapse; 0.10 maintained healthy exploration. Phase 5 reduced to 0.03 successfully after the policy stabilized.
 
 4. **Watch for buffer/trade win rate divergence** - When these diverge, the agent is optimizing the wrong objective.
 
-5. **Robustness to drawdowns** - Both Phase 3 and Phase 4 showed the agent can recover from large adverse moves without policy collapse. Entropy stayed healthy throughout.
+5. **Robustness to drawdowns** - Phases 3, 4, and 5 showed the agent can recover from large adverse moves without policy collapse. Entropy stayed healthy throughout.
+
+6. **Temporal context improves decisions** - Phase 5's TemporalEncoder (processing last 5 states) captures momentum and trend patterns that single-state observation misses. Asymmetric actor-critic (larger critic) helps value estimation.
+
+7. **Feature normalization matters** - Clamping all 18 features to [-1, 1] prevents any single feature from dominating the gradient signal.
 
 ---
 
-*December 29-30, 2025*
+*December 29-31, 2025*
