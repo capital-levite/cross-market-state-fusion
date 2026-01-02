@@ -41,6 +41,41 @@ class OrderbookState:
             return self.best_ask - self.best_bid
         return None
 
+    def calculate_slippage(self, balance: float) -> float:
+        """
+        Derive empirical slippage for a given account balance by walking the book.
+        Returns slippage in probability units (actual_price - mid_price).
+        """
+        mid = self.mid_price
+        if not mid or not self.asks:
+            return 0.005 # Default if book is empty
+
+        # Target shares = balance / mid (theoretical)
+        target_shares = balance / mid
+        
+        filled_shares = 0.0
+        total_cost = 0.0
+        
+        for price, size in self.asks:
+            needed = target_shares - filled_shares
+            take = min(needed, size)
+            
+            total_cost += take * price
+            filled_shares += take
+            
+            if filled_shares >= target_shares:
+                break
+        
+        if filled_shares < target_shares:
+            # Not enough depth, assume remaining fill at best_ask + penalty
+            remaining = target_shares - filled_shares
+            penalty_price = self.best_ask * 1.05 # 5% penalty for deep book
+            total_cost += remaining * penalty_price
+            filled_shares += remaining
+            
+        actual_avg_price = total_cost / filled_shares
+        return max(0, actual_avg_price - mid)
+
 
 class OrderbookStreamer:
     """Stream orderbook data from Polymarket CLOB."""

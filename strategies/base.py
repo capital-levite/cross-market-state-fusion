@@ -102,9 +102,10 @@ class MarketState:
     # Regime context (only slow features worth keeping)
     vol_regime: float = 0.0  # High/low vol environment
     trend_regime: float = 0.0  # Trending or ranging
+    slippage: float = 0.0    # Current execution slippage estimate
 
     def to_features(self) -> np.ndarray:
-        """Convert to feature vector for ML models. Returns 18 features normalized to [-1, 1]."""
+        """Convert to feature vector for ML models. Returns 19 features normalized to [-1, 1]."""
         velocity = self._velocity(3)  # Shorter window
         vol_5m = self._volatility(30)  # ~5 min of ticks
 
@@ -146,6 +147,12 @@ class MarketState:
             # Regime (2)
             self.vol_regime,  # 0 or 1
             self.trend_regime,  # 0 or 1
+
+            # Slippage (1) - New feature
+            clamp(self.slippage * 100), # Typical slippage 0.005-0.02, so *100 maps to [0.5, 2]
+
+            # Absolute Spread (1) - New feature
+            clamp(self.spread * 100), # Absolute spread in prob units
         ], dtype=np.float32)
 
     def _velocity(self, window: int = 5) -> float:

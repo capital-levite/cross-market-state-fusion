@@ -57,10 +57,11 @@ class TradingEngine:
     Paper trading engine with strategy harness.
     """
 
-    def __init__(self, strategy: Strategy, trade_size: float = 10.0, max_trades: int = 0):
+    def __init__(self, strategy: Strategy, trade_size: float = 10.0, max_trades: int = 0, slippage: float = 0.005):
         self.strategy = strategy
         self.trade_size = trade_size
         self.max_trades = max_trades
+        self.slippage = slippage
 
         # Streamers
         self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -139,7 +140,8 @@ class TradingEngine:
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
         """Execute paper trade with flexible sizing and slippage."""
-        slippage = 0.005  # 0.5 cent slippage
+        # Use empirical slippage from state, fallback to engine default if not set
+        slippage = state.slippage if state.slippage > 0 else self.slippage
         if action == Action.HOLD:
             return
 
@@ -328,6 +330,9 @@ class TradingEngine:
                         ask_vol_l5 = sum(size for _, size in ob.asks[:5])
                         total_l5 = bid_vol_l5 + ask_vol_l5
                         state.order_book_imbalance_l5 = (bid_vol_l5 - ask_vol_l5) / total_l5 if total_l5 > 0 else 0.0
+
+                        # Dynamic slippage calculation for configured size
+                        state.slippage = ob.calculate_slippage(self.trade_size)
 
                 # Update binance price
                 binance_price = self.price_streamer.get_price(m.asset)
@@ -617,6 +622,7 @@ async def main():
     parser.add_argument("--load", type=str, help="Load RL model from file")
     parser.add_argument("--dashboard", action="store_true", help="Enable web dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
+    parser.add_argument("--slippage", type=float, default=0.005, help="Slippage per trade in probability units (e.g. 0.005 = 0.5c)")
 
     parser.add_argument("--max-trades", type=int, default=0, help="Stop after N trades")
     args = parser.parse_args()
@@ -663,7 +669,7 @@ async def main():
             strategy.eval()
 
     # Run
-    engine = TradingEngine(strategy, trade_size=args.size, max_trades=args.max_trades)
+    engine = TradingEngine(strategy, trade_size=args.size, max_trades=args.max_trades, slippage=args.slippage)
     await engine.run()
 
 
